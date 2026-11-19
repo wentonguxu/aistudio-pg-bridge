@@ -253,6 +253,8 @@ class RelayAccountStore {
             }
             if (data.email) restored.email = String(data.email);
             if (data.gaiaId) restored.gaiaId = String(data.gaiaId);
+            restored.modelUsage = data.modelUsage || {};
+            restored.usageStartedAt = data.usageStartedAt || null;
             if (data.expiredAt) {
               restored.expiredAt = Number(data.expiredAt) || Date.now();
               restored.status = 'error';
@@ -261,6 +263,7 @@ class RelayAccountStore {
             const curBucket = currentQuotaBucket();
             if (data.dailyBucket === curBucket) {
               restored.dailyBucket = curBucket;
+              restored.usage = data.usage || { success: 0, failed: 0 };
               restored.requestsCount = Number(data.requestsCount || 0);
               restored.dailyModelCounts =
                 data.dailyModelCounts && typeof data.dailyModelCounts === 'object'
@@ -270,6 +273,8 @@ class RelayAccountStore {
               restored.dailyBucket = curBucket;
               restored.requestsCount = 0;
               restored.dailyModelCounts = {};
+              restored.usage = { success: 0, failed: 0 };
+              for (const m of Object.values(restored.modelUsage)) { m.success = 0; m.failed = 0; }
             }
           }
           loaded += 1;
@@ -502,8 +507,14 @@ class RelayAccountStore {
       dailyBucket: curBucket,
       requestsCount: sameBucket ? existing.requestsCount || 0 : 0,
       dailyModelCounts: sameBucket && existing.dailyModelCounts ? { ...existing.dailyModelCounts } : {},
+      usage: sameBucket && existing.usage ? { ...existing.usage } : { success: 0, failed: 0 },
+      modelUsage: existing && existing.modelUsage ? JSON.parse(JSON.stringify(existing.modelUsage)) : {},
+      usageStartedAt: existing ? existing.usageStartedAt || null : null,
       lastError: null,
     };
+    if (!sameBucket) {
+      for (const m of Object.values(entry.modelUsage)) { m.success = 0; m.failed = 0; }
+    }
     // Fold any stale duplicate of the same Google account into this entry.
     if (entry.gaiaId) {
       for (const [otherId, other] of Array.from(this.accounts.entries())) {
@@ -741,6 +752,8 @@ class RelayAccountStore {
       entry.dailyBucket = curBucket;
       entry.requestsCount = 0;
       entry.dailyModelCounts = {};
+      entry.usage = { success: 0, failed: 0 };
+      for (const m of Object.values(entry.modelUsage || {})) { m.success = 0; m.failed = 0; }
       this.persist(entry);
     } else if (!entry.dailyModelCounts || typeof entry.dailyModelCounts !== 'object') {
       entry.dailyModelCounts = {};
@@ -760,6 +773,32 @@ class RelayAccountStore {
     if (cleanModel) {
       entry.dailyModelCounts[cleanModel] = (entry.dailyModelCounts[cleanModel] || 0) + 1;
     }
+    this.persist(entry);
+  }
+
+  recordOutcome(accountId, model, outcome = {}) {
+    const entry = this.accounts.get(accountId);
+    if (!entry) return;
+    this._ensureDailyBucket(entry);
+    const now = Date.now();
+    const name = String(model || 'unknown').replace(/^models\//, '');
+    const usage = entry.usage || (entry.usage = { success: 0, failed: 0 });
+    const models = entry.modelUsage || (entry.modelUsage = {});
+    if (!Object.hasOwn(models, name)) {
+      Object.defineProperty(models, name, { value: { success: 0, failed: 0 }, enumerable: true, writable: true, configurable: true });
+    }
+    const detail = models[name];
+    const field = outcome.ok ? 'success' : 'failed';
+    usage[field] = Number(usage[field] || 0) + 1;
+    detail[field] = Number(detail[field] || 0) + 1;
+    detail.state = outcome.ok ? 'available' : outcome.kind === 'proof' ? 'proof_error'
+      : outcome.status === 429 ? 'limited' : outcome.status === 401 ? 'auth_error'
+      : outcome.status === 403 ? 'permission_error' : 'error';
+    detail.observedAt = now;
+    detail.httpStatus = outcome.status || (outcome.ok ? 200 : null);
+    detail.errorKind = outcome.ok ? null : outcome.kind || 'upstream';
+    entry.lastUsedAt = now;
+    entry.usageStartedAt = entry.usageStartedAt || now;
     this.persist(entry);
   }
 
@@ -786,6 +825,10 @@ class RelayAccountStore {
       lastUsedAt: entry.lastUsedAt,
       dailyBucket: entry.dailyBucket,
       requestsCount: entry.requestsCount || 0,
+      usage: entry.usage || { success: 0, failed: 0 },
+      modelUsage: entry.modelUsage || {},
+      usageStartedAt: entry.usageStartedAt || null,
+      remainingQuota: null,
       topModels,
       lastError: entry.lastError,
     };
@@ -1504,7 +1547,7 @@ function renderTestBadge(accountId) {
   if (!r) return '';
   if (r.loading) return '<span class="pill amber" style="margin-right:6px;">TESTING...</span>';
   if (r.quota429) {
-    return '<span class="pill green" style="margin-right:6px;" title="凭证有效（当前模型今日配额已满）">429 OK · ' + r.elapsedMs + 'ms</span>';
+    return '<span class="pill amber" style="margin-right:6px;" title="当前模型受到限流或配额限制，不能据此确定今日剩余额度">429 限制 · ' + r.elapsedMs + 'ms</span>';
   }
   if (r.alive) return '<span class="pill green" style="margin-right:6px;">OK · ' + r.elapsedMs + 'ms</span>';
   const fullErr = String(r.error || '未知错误');
@@ -1520,11 +1563,30 @@ function renderTestBadge(accountId) {
 function renderUsageHtml(a) {
   const total = a.requestsCount || 0;
   const tops = Array.isArray(a.topModels) ? a.topModels : [];
-  if (tops.length === 0) return '<span>' + total + '</span>';
+  const esc = s => String(s == null ? '' : s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
   const tags = tops
-    .map(t => '<span class="pill gray" style="padding:1px 6px;font-size:11px;">' + t.model + ' ×' + t.count + '</span>')
+    .map(t => '<span class="pill gray" style="padding:1px 6px;font-size:11px;">' + esc(t.model) + ' ×' + Number(t.count || 0) + '</span>')
     .join(' ');
-  return '<div style="display:flex;flex-direction:column;gap:4px;align-items:flex-start;"><strong>' + total + ' 次</strong><div style="display:flex;gap:4px;flex-wrap:wrap;">' + tags + '</div></div>';
+  const usage = a.usage || {};
+  const labels = { available: '最近成功', proof_error: '签名服务异常', limited: '限流 / 配额限制', auth_error: '凭证异常', permission_error: '权限 / 地区限制', error: '调用异常' };
+  const rows = Object.entries(a.modelUsage || {}).map(function(pair) {
+    const model = pair[0], m = pair[1];
+    const stamp = m.observedAt ? new Date(m.observedAt).toLocaleString() : '未测试';
+    return '<div style="padding:6px 0;border-top:1px solid var(--border);"><code>' + esc(model) + '</code><br>'
+      + esc(labels[m.state] || '未知') + (m.httpStatus ? ' · HTTP ' + Number(m.httpStatus) : '')
+      + '<br>今日成功 ' + Number(m.success || 0) + ' / 失败 ' + Number(m.failed || 0)
+      + '<br><small style="color:var(--muted)">状态观测于 ' + esc(stamp) + '</small></div>';
+  }).join('');
+  const open = window.__USAGE_OPEN__ && window.__USAGE_OPEN__[a.accountId];
+  return '<div style="display:flex;flex-direction:column;gap:4px;align-items:flex-start;"><strong>上游已接收 ' + total + ' 次</strong>'
+    + '<div style="display:flex;gap:4px;flex-wrap:wrap;">' + tags + '</div>'
+    + '<span>完整响应成功 ' + Number(usage.success || 0) + ' / 失败 ' + Number(usage.failed || 0) + '</span>'
+    + '<span style="color:var(--muted)">剩余额度：未知</span>'
+    + '<details data-usage-acc="' + esc(a.accountId) + '"' + (open ? ' open' : '') + '><summary style="cursor:pointer;">各模型调用详情</summary>'
+    + (rows || '<div>尚无调用记录</div>')
+    + '<small style="color:var(--muted)">仅统计本中转，含测试与重试；状态来自最近一次调用，不保证当前仍可用。15:00 仅为本地统计重置时间。'
+    + (a.usageStartedAt ? '<br>详细统计始于 ' + esc(new Date(a.usageStartedAt).toLocaleString()) : '<br>详细统计从更新后的首次调用开始')
+    + '</small></details></div>';
 }
 
 async function refreshStatus() {
@@ -1555,6 +1617,11 @@ async function refreshStatus() {
       window.__ERR_TOGGLE_BOUND__ = true;
       document.addEventListener('toggle', function (ev) {
         const el = ev.target;
+        if (el && el.getAttribute && el.getAttribute('data-usage-acc')) {
+          window.__USAGE_OPEN__ = window.__USAGE_OPEN__ || {};
+          window.__USAGE_OPEN__[el.getAttribute('data-usage-acc')] = el.open;
+          return;
+        }
         if (!el || !el.classList || !el.classList.contains('errbox')) return;
         const id = el.getAttribute('data-err-acc');
         if (!id) return;

@@ -18,6 +18,7 @@
 const http = require('node:http');
 const assert = require('node:assert');
 const { createRelayServer } = require('../src/relay-server');
+const { RelayAccountStore } = require('../src/dashboard');
 
 async function runTest() {
   let lastProofMintBody = null;
@@ -206,6 +207,7 @@ async function runTest() {
 
   // 3. Start Relay Gateway
   const relay = createRelayServer({
+    accountStore: new RelayAccountStore(),
     host: '127.0.0.1',
     port: 0,
     proofServerUrl: `http://127.0.0.1:${proofPort}`,
@@ -687,6 +689,7 @@ async function runTest() {
   assert.deepStrictEqual(oaiFcTurn1.choices[0].message.tool_calls[0], {
     id: 'call_tokyo_1',
     type: 'function',
+    extra_content: { google: { thought_signature: 'EtIGCs8GA_PARALLEL_FC_SIG==' } },
     function: {
       name: 'getWeather',
       arguments: JSON.stringify({ city: 'Tokyo' }),
@@ -747,10 +750,10 @@ async function runTest() {
   const oaiToolRespTurnWire = capturedUpstreamWire[1][2];
   assert.strictEqual(oaiModelTurnWire[1], 'model');
   assert.strictEqual(oaiModelTurnWire[0].length, 2);
-  // First functionCall part automatically carries `btoa("skip_thought_signature_validator")` at index 14!
+  // Replay the original signature supplied by the previous model response.
   assert.strictEqual(
     oaiModelTurnWire[0][0][14],
-    Buffer.from('skip_thought_signature_validator', 'utf8').toString('base64'),
+    'EtIGCs8GA_PARALLEL_FC_SIG==',
   );
   assert.strictEqual(oaiModelTurnWire[0][1].length, 11);
   // Consecutive `role: "tool"` messages are merged into a single `"user"` turn with 2 functionResponse parts

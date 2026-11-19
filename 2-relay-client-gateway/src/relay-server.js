@@ -1925,24 +1925,36 @@ class WaaRelayClient {
     if (min.map.size === 0) {
       throw new Error('No valid Google cookies provided to Relay Client');
     }
-    const res = await fetchWithSystemProxyFallback(`${this.proofServerUrl}/v1/proof/mint`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        cookies: min.header,
-        authUser: authUser ?? this.defaultAuthUser,
-        g1Tier,
-        model: model || this.defaultModel,
-        wireContents,
-        generationConfig,
-        ...(forceRefresh ? { forceRefresh: true } : {}),
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok || !data.ok) {
-      throw new Error(`Proof Server error (${res.status}): ${data.error || 'unknown'}`);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const res = await fetchWithSystemProxyFallback(`${this.proofServerUrl}/v1/proof/mint`, {
+          method: 'POST',
+          signal: AbortSignal.timeout(25000),
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            cookies: min.header,
+            authUser: authUser ?? this.defaultAuthUser,
+            g1Tier,
+            model: model || this.defaultModel,
+            wireContents,
+            generationConfig,
+            ...(forceRefresh ? { forceRefresh: true } : {}),
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          const error = new Error(`Proof Server error (${res.status}): ${data.error || 'unknown'}`);
+          error.proofStatus = res.status;
+          throw error;
+        }
+        return data;
+      } catch (error) {
+        error.failureKind = 'proof';
+        error.httpStatus = 502;
+        if (attempt === 1 || (error.proofStatus && error.proofStatus < 500)) throw error;
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
     }
-    return data;
   }
 
   /** Persist refreshed cookies back into the account store (memory + cookies/*.json). */
@@ -2035,7 +2047,28 @@ class WaaRelayClient {
     return probeAiStudioSession(cookieHeader);
   }
 
+  finishUsageAttempt(attempt, error = null) {
+    if (!attempt || attempt.recorded) return;
+    attempt.recorded = true;
+    this.accountStore.recordOutcome?.(attempt.accountId, attempt.model, {
+      ok: !error, kind: error?.failureKind || 'upstream',
+      status: error?.proofStatus || error?.httpStatus || (error ? 502 : 200),
+    });
+  }
+
   async openGenerateStream(params, retryState = null) {
+    const attempt = { accountId: params.accountId, model: resolveModelAlias(params.model || this.defaultModel), recorded: false };
+    try {
+      const result = await this._openGenerateStream({ ...params, __usageAttempt: attempt }, retryState);
+      result.usageAttempt = result.usageAttempt || attempt;
+      return result;
+    } catch (error) {
+      this.finishUsageAttempt(attempt, error);
+      throw error;
+    }
+  }
+
+  async _openGenerateStream(params, retryState = null) {
     if (params && isAntiCensorModel(params.model)) {
       const baseModel = stripAntiCensorPrefix(params.model);
       const hasPayload =
@@ -2163,6 +2196,7 @@ class WaaRelayClient {
       });
     } catch (err) {
       // Network failure is retryable on the next account.
+      this.finishUsageAttempt(params.__usageAttempt, err);
       const switched = this.retryWithNextAccount(state, params, resolvedWireContents, targetModel);
       if (switched) return switched;
       const netErr = new Error(`Google GenerateContent network error: ${err.message}`);
@@ -2191,6 +2225,7 @@ class WaaRelayClient {
         htmlText = await res.text();
       } catch {}
       const snippet = extractUpstreamHtmlMessage(htmlText);
+      this.finishUsageAttempt(params.__usageAttempt, { httpStatus: 502, failureKind: 'upstream_html' });
       const htmlKey = accountId || 'default';
       const countHtml = (state.retryHtmlCounts && state.retryHtmlCounts.get(htmlKey)) || 0;
       if (countHtml < 1) {
@@ -2226,6 +2261,7 @@ class WaaRelayClient {
 
     if (!res.ok) {
       const rawText = await res.text();
+      this.finishUsageAttempt(params.__usageAttempt, { httpStatus: res.status, failureKind: 'upstream' });
       const regionBlocked = res.status === 403 && rawText.includes('Region not supported');
       // 除 400（请求本身非法，换号也没用）和地区限制外，任何非 2xx 都换号重试。
       const isRetryable = !regionBlocked && res.status !== 400;
@@ -2366,78 +2402,103 @@ class WaaRelayClient {
 
   async callGenerateContent(params) {
     const wrapMode = isAntiCensorModel(params && params.model);
-    const { res, proofPkg, targetModel, tRpc0 } = await this.openGenerateStream(params);
-    const rawText = await res.text();
-    const rpcMs = Date.now() - tRpc0;
-    let parsed = parseMakerSuiteResponse(rawText);
-    if (wrapMode) {
-      wrapCapture('response', {
-        mode: 'non-stream',
-        ms: Date.now() - (params.__wrapT0 || Date.now()),
-        finishReason: parsed.finishReasonName,
-        usage: parsed.usage,
-        text: parsed.text,
-        rawLen: rawText.length,
-        rawHead: rawText.slice(0, 6000),
-      });
-      parsed = applyAntiCensorToParsed(parsed);
+    const { res, proofPkg, targetModel, tRpc0, usageAttempt } = await this.openGenerateStream(params);
+    try {
+      const rawText = await res.text();
+      const rpcMs = Date.now() - tRpc0;
+      let parsed = parseMakerSuiteResponse(rawText);
+      if (wrapMode) {
+        wrapCapture('response', {
+          mode: 'non-stream',
+          ms: Date.now() - (params.__wrapT0 || Date.now()),
+          finishReason: parsed.finishReasonName,
+          usage: parsed.usage,
+          text: parsed.text,
+          rawLen: rawText.length,
+          rawHead: rawText.slice(0, 6000),
+        });
+        parsed = applyAntiCensorToParsed(parsed);
+      }
+      this.finishUsageAttempt(usageAttempt);
+      return {
+        parsed,
+        proof: proofPkg.proof,
+        proofLength: proofPkg.proofLength,
+        proofMode: proofPkg.proofMode,
+        digest: proofPkg.digest,
+        accountId: proofPkg.accountId,
+        poolState: proofPkg.poolState,
+        timingMs: {
+          ...proofPkg.timingMs,
+          generateRpc: rpcMs,
+        },
+        model: targetModel,
+      };
+    } catch (error) {
+      this.finishUsageAttempt(usageAttempt, error);
+      throw error;
     }
-    return {
-      parsed,
-      proof: proofPkg.proof,
-      proofLength: proofPkg.proofLength,
-      proofMode: proofPkg.proofMode,
-      digest: proofPkg.digest,
-      accountId: proofPkg.accountId,
-      poolState: proofPkg.poolState,
-      timingMs: {
-        ...proofPkg.timingMs,
-        generateRpc: rpcMs,
-      },
-      model: targetModel,
-    };
   }
 
   async streamGenerateContent(params, onDelta) {
     const wrapMode = isAntiCensorModel(params && params.model);
-    const { res, proofPkg, targetModel, tRpc0 } = await this.openGenerateStream(params);
-    let rawAll = '';
-    const parser = new IncrementalJspbFrameParser((frame) => {
-      const delta = parseSingleMakerSuiteFrame(frame);
-      if (wrapMode) applyAntiCensorToDelta(delta);
-      onDelta({ ...delta, frame });
-    });
-
-    if (res.body && typeof res.body.getReader === 'function') {
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder('utf-8');
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunkStr = decoder.decode(value, { stream: true });
-        rawAll += chunkStr;
-        parser.feed(chunkStr);
-      }
-      const tail = decoder.decode();
-      if (tail) parser.feed(tail);
-    } else {
-      const rawText = await res.text();
-      parser.feed(rawText);
-    }
-
-    if (wrapMode) {
-      wrapCapture('response', {
-        mode: 'stream',
-        ms: Date.now() - (params.__wrapT0 || Date.now()),
-        rawLen: rawAll.length,
-        rawHead: rawAll.slice(0, 12000),
+    const { res, proofPkg, targetModel, tRpc0, usageAttempt } = await this.openGenerateStream(params);
+    try {
+      let rawAll = '';
+      let sawFinishReason = false;
+      const parser = new IncrementalJspbFrameParser((frame) => {
+        const delta = parseSingleMakerSuiteFrame(frame);
+        if (delta.finishReasonCode != null) sawFinishReason = true;
+        if (wrapMode) applyAntiCensorToDelta(delta);
+        onDelta({ ...delta, frame });
       });
+
+      if (res.body && typeof res.body.getReader === 'function') {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunkStr = decoder.decode(value, { stream: true });
+          rawAll += chunkStr;
+          parser.feed(chunkStr);
+        }
+        const tail = decoder.decode();
+        if (tail) { rawAll += tail; parser.feed(tail); }
+      } else {
+        const rawText = await res.text();
+        rawAll = rawText;
+        parser.feed(rawText);
+      }
+
+      // EOF alone does not prove that the protobuf JSON stream completed.
+      let validEnvelope = false;
+      try { validEnvelope = Array.isArray(JSON.parse(rawAll)); } catch {}
+      if (!validEnvelope || !sawFinishReason) {
+        const error = new Error('Google GenerateContent stream is malformed or incomplete');
+        error.httpStatus = 502;
+        error.failureKind = 'incomplete_response';
+        throw error;
+      }
+
+      if (wrapMode) {
+        wrapCapture('response', {
+          mode: 'stream',
+          ms: Date.now() - (params.__wrapT0 || Date.now()),
+          rawLen: rawAll.length,
+          rawHead: rawAll.slice(0, 12000),
+        });
+      }
+      this.finishUsageAttempt(usageAttempt);
+      return {
+        proofPkg,
+        model: targetModel,
+        rpcMs: Date.now() - tRpc0,
+      };
+    } catch (error) {
+      this.finishUsageAttempt(usageAttempt, error);
+      throw error;
     }
-    return {
-      proofPkg,
-      model: targetModel,
-      rpcMs: Date.now() - tRpc0,
-    };
   }
 
   async chatCompletions(openAiBody = {}, authOverrides = {}) {
@@ -2957,7 +3018,7 @@ function createRelayServer(options = {}) {
               quota429: true,
               model: 'gemini-3.5-flash-lite',
               elapsedMs: Date.now() - t0,
-              reply: '凭证有效（当前模型今日配额已满）',
+              reply: '当前模型受到限流或配额限制，无法确定今日剩余额度',
             });
           }
           entry.lastError = msg;
@@ -3435,7 +3496,7 @@ function createRelayServer(options = {}) {
       return sendJson(res, status, {
         error: {
           message: err && err.message ? err.message : String(err),
-          type: 'relay_error',
+          type: err.failureKind === 'proof' ? 'proof_server_error' : 'relay_error',
           code: status,
         },
       });
