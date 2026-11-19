@@ -1941,9 +1941,20 @@ class WaaRelayClient {
             ...(forceRefresh ? { forceRefresh: true } : {}),
           }),
         });
-        const data = await res.json();
-        if (!res.ok || !data.ok) {
-          const error = new Error(`Proof Server error (${res.status}): ${data.error || 'unknown'}`);
+        const text = await res.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          const format = /^\s*</.test(text) ? 'HTML' : 'invalid JSON';
+          const error = new Error(`Proof Server 返回非 JSON 响应 (${format}, HTTP ${res.status})；签名服务或其中间网络返回异常，请稍后重试。`);
+          error.proofStatus = res.status;
+          error.responseFormat = format;
+          error.retryable = res.ok || res.status >= 500;
+          throw error;
+        }
+        if (!res.ok || !data || !data.ok) {
+          const error = new Error(`Proof Server error (${res.status}): ${(data && data.error) || 'unknown'}`);
           error.proofStatus = res.status;
           throw error;
         }
@@ -1951,7 +1962,7 @@ class WaaRelayClient {
       } catch (error) {
         error.failureKind = 'proof';
         error.httpStatus = 502;
-        if (attempt === 1 || (error.proofStatus && error.proofStatus < 500)) throw error;
+        if (attempt === 1 || (error.proofStatus && error.proofStatus < 500 && error.retryable !== true)) throw error;
         await new Promise(resolve => setTimeout(resolve, 300));
       }
     }

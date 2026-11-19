@@ -74,6 +74,36 @@ test('dashboard explains observed usage and unknown quota', () => {
   for (const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) new vm.Script(match[1]);
 });
 
+test('non-JSON proof responses identify the service and retry only transient failures', async () => {
+  for (const [status, body, format, attempts] of [
+    [502, '<html><h1>Bad gateway</h1></html>', 'HTML', 2],
+    [200, '<html><h1>Temporary error</h1></html>', 'HTML', 2],
+    [403, '<html><h1>Forbidden</h1></html>', 'HTML', 1],
+    [200, 'invalid JSON', 'invalid JSON', 2],
+  ]) {
+    let calls = 0;
+    const server = http.createServer((req, res) => {
+      req.resume(); calls++;
+      res.writeHead(status, { 'Content-Type': 'text/html' });
+      res.end(body);
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const client = new WaaRelayClient({ accountStore: new RelayAccountStore(), proofServerUrl: `http://127.0.0.1:${server.address().port}` });
+      await assert.rejects(client.requestProof({ cookies: COOKIES }), error => {
+        assert.equal(error.failureKind, 'proof');
+        assert.equal(error.httpStatus, 502);
+        assert.equal(error.proofStatus, status);
+        assert.equal(error.responseFormat, format);
+        assert.ok(error.message.includes('Proof Server'));
+        assert.ok(!error.message.includes('<html>'));
+        return true;
+      });
+      assert.equal(calls, attempts);
+    } finally { await new Promise(resolve => server.close(resolve)); }
+  }
+});
+
 test('failover attributes failures and completed responses to the actual accounts', async () => {
   const store = new RelayAccountStore();
   store.backfillIdentities = async () => ({ filled: 0, failed: 0 });
