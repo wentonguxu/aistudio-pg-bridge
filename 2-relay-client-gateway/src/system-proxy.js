@@ -487,6 +487,16 @@ async function fetchWithSystemProxyFallback(url, options = {}) {
     return globalThis.fetch(url, options);
   }
 
+  // Native proxy mode pools connections; avoid a new CONNECT/TLS tunnel per call.
+  const nativeProxyEnabled = process.execArgv.includes('--use-env-proxy') &&
+    !process.execArgv.includes('--no-use-env-proxy');
+  const envProxy = parsedUrl.protocol === 'https:'
+    ? process.env.https_proxy || process.env.HTTPS_PROXY
+    : process.env.http_proxy || process.env.HTTP_PROXY;
+  if (nativeProxyEnabled && normalizeProxyUrl(envProxy)) {
+    return globalThis.fetch(url, options);
+  }
+
   const proxyInfo = await resolveSystemProxyInfo();
   if (proxyInfo && proxyInfo.proxyUrl) {
     try {
