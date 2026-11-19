@@ -165,6 +165,11 @@ async function probeSessionAccounts(cookies, opts = {}) {
   return out;
 }
 
+function usageModelKey(model) {
+  const unwrapped = String(model || 'unknown').replaceAll('防外审截断-', '');
+  return resolveModelAlias(unwrapped).replace(/^models\//, '');
+}
+
 function resolveModelAlias(modelInput, fallback = 'models/gemini-3.8-flash') {
   const raw = String(modelInput || '')
     .trim()
@@ -723,18 +728,28 @@ class RelayAccountStore {
     return count;
   }
 
-  pickAccount() {
-    return this.pickAccountExcluding();
+  pickAccount(model = null) {
+    return this.pickAccountExcluding(null, model);
   }
 
   /**
-   * Round-robin pick among ready accounts, skipping any id already tried by
-   * the current request (used for automatic failover).
+   * Prefer recent success for this model, then round-robin within eligible
+   * accounts. A short model-specific cooldown avoids repeating recent failures.
    */
-  pickAccountExcluding(excludedIds = null) {
-    const list = Array.from(this.accounts.values()).filter((a) => a.status === 'ready');
-    if (list.length === 0) return null;
+  pickAccountExcluding(excludedIds = null, model = null) {
     const excluded = excludedIds instanceof Set ? excludedIds : new Set(excludedIds || []);
+    let list = Array.from(this.accounts.values()).filter((a) => a.status === 'ready' && !excluded.has(a.accountId));
+    if (model) {
+      const key = usageModelKey(model);
+      const now = Date.now();
+      list = list.filter(a => Number(a.modelUsage?.[key]?.cooldownUntil || 0) <= now);
+      const recentSuccess = list.filter(a => {
+        const detail = a.modelUsage?.[key];
+        return detail?.state === 'available' && now - Number(detail.observedAt || 0) < 30 * 60_000;
+      });
+      if (recentSuccess.length) list = recentSuccess;
+    }
+    if (list.length === 0) return null;
     for (let i = 0; i < list.length; i += 1) {
       const idx = (this.rrIndex + i) % list.length;
       const candidate = list[idx];
@@ -781,7 +796,7 @@ class RelayAccountStore {
     if (!entry) return;
     this._ensureDailyBucket(entry);
     const now = Date.now();
-    const name = String(model || 'unknown').replace(/^models\//, '');
+    const name = usageModelKey(model);
     const usage = entry.usage || (entry.usage = { success: 0, failed: 0 });
     const models = entry.modelUsage || (entry.modelUsage = {});
     if (!Object.hasOwn(models, name)) {
@@ -795,6 +810,7 @@ class RelayAccountStore {
       : outcome.status === 429 ? 'limited' : outcome.status === 401 ? 'auth_error'
       : outcome.status === 403 ? 'permission_error' : 'error';
     detail.observedAt = now;
+    detail.cooldownUntil = outcome.ok ? 0 : now + 30_000;
     detail.httpStatus = outcome.status || (outcome.ok ? 200 : null);
     detail.errorKind = outcome.ok ? null : outcome.kind || 'upstream';
     entry.lastUsedAt = now;
@@ -1574,6 +1590,7 @@ function renderUsageHtml(a) {
     const stamp = m.observedAt ? new Date(m.observedAt).toLocaleString() : '未测试';
     return '<div style="padding:6px 0;border-top:1px solid var(--border);"><code>' + esc(model) + '</code><br>'
       + esc(labels[m.state] || '未知') + (m.httpStatus ? ' · HTTP ' + Number(m.httpStatus) : '')
+      + (Number(m.cooldownUntil || 0) > Date.now() ? '<br>临时冷却中，稍后自动恢复选取' : '')
       + '<br>今日成功 ' + Number(m.success || 0) + ' / 失败 ' + Number(m.failed || 0)
       + '<br><small style="color:var(--muted)">状态观测于 ' + esc(stamp) + '</small></div>';
   }).join('');

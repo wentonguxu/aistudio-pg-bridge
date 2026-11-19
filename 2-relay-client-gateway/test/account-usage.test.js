@@ -7,7 +7,7 @@ const path = require('node:path');
 const http = require('node:http');
 const vm = require('node:vm');
 const { RelayAccountStore, renderDashboardHtml } = require('../src/dashboard');
-const { WaaRelayClient } = require('../src/relay-server');
+const { WaaRelayClient, createRelayServer } = require('../src/relay-server');
 const COOKIES = 'SID=fake; SAPISID=fake; HSID=fake; SSID=fake; __Secure-1PSID=fake';
 const STREAM_BODY = JSON.stringify([[[[[null, 1]]]]]);
 
@@ -23,6 +23,7 @@ test('daily outcomes persist, keep model-specific failures and never invent quot
     assert.equal(view.usage.success, 1);
     assert.equal(view.usage.failed, 1);
     assert.equal(view.modelUsage['gemini-4-argon'].state, 'proof_error');
+    assert.ok(view.modelUsage['gemini-4-argon'].cooldownUntil > Date.now());
     assert.equal(view.modelUsage['gemini-3.8-flash'].state, 'available');
     assert.equal(view.remainingQuota, null);
     assert.equal('cookies' in view, false);
@@ -170,4 +171,73 @@ test('malformed or truncated streams are not marked as complete successes', asyn
   }
   assert.equal(store.listPublic()[0].usage.success, 0);
   assert.equal(store.listPublic()[0].usage.failed, 2);
+});
+
+test('selection prefers recent model success and cools failures only for that model', () => {
+  const store = new RelayAccountStore();
+  const first = store.addAccount(COOKIES);
+  const second = store.addAccount(COOKIES.replaceAll('fake', 'other'));
+  store.recordOutcome(second.accountId, 'gemini-4-argon', { ok: true });
+  assert.equal(store.pickAccount('gemini-4-argon-low').accountId, second.accountId);
+  store.recordOutcome(second.accountId, 'gemini-4-argon', { ok: false, kind: 'proof', status: 500 });
+  assert.equal(store.pickAccount('gemini-4-argon').accountId, first.accountId);
+  assert.equal(store.pickAccount('防外审截断-gemini-4-argon-low').accountId, first.accountId);
+  assert.equal(store.pickAccountExcluding(new Set([first.accountId]), 'gemini-3.8-flash').accountId, second.accountId);
+  store.recordOutcome(first.accountId, 'gemini-4-argon', { ok: false, status: 502 });
+  assert.equal(store.pickAccount('gemini-4-argon'), null);
+  store.recordOutcome(second.accountId, '防外审截断-gemini-4-argon-low', { ok: false, status: 502 });
+  assert.equal(store.pickAccount('防外审截断-gemini-4-argon-low'), null);
+  store.accounts.get(first.accountId).modelUsage['gemini-4-argon'].cooldownUntil = Date.now() - 1;
+  assert.equal(store.pickAccount('gemini-4-argon').accountId, first.accountId);
+  store.recordOutcome(second.accountId, 'gemini-4-argon', { ok: true });
+  assert.equal(store.pickAccount('gemini-4-argon').accountId, second.accountId);
+});
+
+test('model cooldown reports 503 without attempting generation', async () => {
+  const store = new RelayAccountStore();
+  const account = store.addAccount(COOKIES);
+  store.backfillIdentities = async () => ({ filled: 0, failed: 0 });
+  store.recordOutcome(account.accountId, 'gemini-4-argon', { ok: false, status: 502 });
+  const client = new WaaRelayClient({ accountStore: store });
+  let calls = 0;
+  client.chatCompletions = async () => { calls++; return { response: {}, meta: {} }; };
+  client.geminiGenerateContent = async () => { calls++; return { response: {}, meta: {} }; };
+  const server = createRelayServer({ client, port: 0, apiKey: 'test' });
+  const info = await server.listen();
+  try {
+    for (const endpoint of ['/v1/chat/completions', '/v1beta/models/gemini-4-argon:generateContent']) {
+      const response = await fetch(info.url + endpoint, { method: 'POST', headers: { Authorization: 'Bearer test', 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'gemini-4-argon' }) });
+      assert.equal(response.status, 503);
+      assert.equal(calls, 0);
+    }
+  } finally { await server.close(); }
+});
+
+test('proof failure switches account once and honors the failover time window', async () => {
+  const store = new RelayAccountStore();
+  store.backfillIdentities = async () => ({ filled: 0, failed: 0 });
+  const first = store.addAccount(COOKIES);
+  const second = store.addAccount(COOKIES.replaceAll('fake', 'other'));
+  let thinkingLevel;
+  const server = http.createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk;
+    if (req.url === '/v1/proof/mint') {
+      const failing = JSON.parse(body).cookies.includes('SAPISID=fake');
+      res.writeHead(failing ? 500 : 200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(failing ? { ok: false, error: 'temporary signing failure' } : { ok: true, proof: '!fake' }));
+    }
+    thinkingLevel = JSON.parse(body)[3][16][3];
+    res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(STREAM_BODY);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const url = `http://127.0.0.1:${server.address().port}`;
+    const client = new WaaRelayClient({ accountStore: store, proofServerUrl: url, generateContentUrl: url + '/generate' });
+    await client.callGenerateContent({ accountId: first.accountId, cookies: COOKIES, fromStore: true, model: 'gemini-4-argon-low', payload: { messages: [{ role: 'user', content: 'Hi' }] } });
+    assert.equal(thinkingLevel, 1, 'failover must preserve the requested low thinking level');
+    const views = store.listPublic();
+    assert.equal(views.find(a => a.accountId === first.accountId).usage.failed, 1);
+    assert.equal(views.find(a => a.accountId === second.accountId).usage.success, 1);
+    assert.equal(client.retryWithNextAccount({ fromStore: true, tried: new Set(), maxAttempts: 3, failoverStartedAt: Date.now() - 31000 }, {}, [], 'gemini-4-argon'), null);
+  } finally { await new Promise(resolve => server.close(resolve)); }
 });

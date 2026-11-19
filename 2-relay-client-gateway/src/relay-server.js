@@ -2122,22 +2122,31 @@ class WaaRelayClient {
     const state =
       retryState || {
         tried: new Set(accountId ? [accountId] : []),
+        failoverStartedAt: Date.now(),
         rotatedAccounts: new Set(),
         retry403Counts: new Map(),
         retryHtmlCounts: new Map(),
         fromStore: !!fromStore,
-        maxAttempts: fromStore && accountId ? Math.max(3, this.accountStore.countReady()) : 1,
+        maxAttempts: fromStore && accountId ? Math.max(1, Math.min(3, this.accountStore.countReady())) : 1,
       };
 
-    const proofPkg = await this.requestProof({
-      cookies,
-      authUser,
-      g1Tier,
-      model: targetModel,
-      wireContents: resolvedWireContents,
-      generationConfig,
-      forceRefresh: Boolean(params.forceRefresh),
-    });
+    let proofPkg;
+    try {
+      proofPkg = await this.requestProof({
+        cookies,
+        authUser,
+        g1Tier,
+        model: targetModel,
+        wireContents: resolvedWireContents,
+        generationConfig,
+        forceRefresh: Boolean(params.forceRefresh),
+      });
+    } catch (error) {
+      this.finishUsageAttempt(params.__usageAttempt, error);
+      const switched = this.retryWithNextAccount(state, params, resolvedWireContents, targetModel);
+      if (switched) return switched;
+      throw error;
+    }
 
     // The signer only returns the proof: cookies + Authorization stay local.
     // (Cookie rotation is also a relay-side concern, see rotateAccountCookies.)
@@ -2245,7 +2254,7 @@ class WaaRelayClient {
           {
             ...params,
             wireContents: resolvedWireContents,
-            model: targetModel,
+            model: params.model || targetModel,
             cookies: auth.cookies,
             g1Tier: resolvedTier,
           },
@@ -2302,7 +2311,7 @@ class WaaRelayClient {
                 {
                   ...params,
                   wireContents: resolvedWireContents,
-                  model: targetModel,
+                  model: params.model || targetModel,
                   cookies: rotated,
                 },
                 state,
@@ -2320,7 +2329,7 @@ class WaaRelayClient {
                 {
                   ...params,
                   wireContents: resolvedWireContents,
-                  model: targetModel,
+                  model: params.model || targetModel,
                   cookies: rotated,
                   g1Tier: resolvedTier,
                   forceRefresh: true,
@@ -2336,7 +2345,7 @@ class WaaRelayClient {
               {
                 ...params,
                 wireContents: resolvedWireContents,
-                model: targetModel,
+                model: params.model || targetModel,
                 cookies: auth.cookies,
                 g1Tier: resolvedTier,
                 forceRefresh: true,
@@ -2392,14 +2401,15 @@ class WaaRelayClient {
    */
   retryWithNextAccount(state, params, wireContents, targetModel) {
     if (!state.fromStore || state.tried.size >= state.maxAttempts) return null;
-    const next = this.accountStore.pickAccountExcluding(state.tried);
+    if (state.failoverStartedAt && Date.now() - state.failoverStartedAt >= 30_000) return null;
+    const next = this.accountStore.pickAccountExcluding(state.tried, targetModel);
     if (!next) return null;
     state.tried.add(next.accountId);
     return this.openGenerateStream(
       {
         wireContents,
         tools: params.tools,
-        model: targetModel,
+        model: params.model || targetModel,
         generationConfig: params.generationConfig,
         cookies: next.cookies,
         authUser: next.authUser,
@@ -2746,7 +2756,7 @@ function isPanelAuthenticated(req, url, expectedApiKey) {
   return false;
 }
 
-function extractRequestAuth(req, body, relayClient, expectedApiKey, url = null) {
+function extractRequestAuth(req, body, relayClient, expectedApiKey, url = null, model = null) {
   let cookies = req.headers['x-google-cookies'] || body.cookies || '';
   let authUser = req.headers['x-goog-authuser'] ?? body.authUser;
   let g1Tier = req.headers['x-aistudio-g1-tier'] || body.g1Tier || null;
@@ -2771,7 +2781,12 @@ function extractRequestAuth(req, body, relayClient, expectedApiKey, url = null) 
   }
 
   if (!cookies && relayClient.accountStore) {
-    const picked = relayClient.accountStore.pickAccount();
+    const picked = relayClient.accountStore.pickAccount(model || relayClient.defaultModel);
+    if (!picked && relayClient.accountStore.countReady() > 0) {
+      const error = new Error('当前模型的可用账号处于短暂冷却，请约 30 秒后重试；其他模型可能仍可使用。');
+      error.httpStatus = 503;
+      throw error;
+    }
     if (picked) {
       cookies = picked.cookies;
       accountId = picked.accountId;
@@ -3108,7 +3123,7 @@ function createRelayServer(options = {}) {
       //    - `thoughtSignature` is omitted (Gemini-only)
       if (req.method === 'POST' && pathname === '/v1/chat/completions') {
         const body = await readJsonBody(req);
-        const auth = extractRequestAuth(req, body, relayClient, apiKey, url);
+        const auth = extractRequestAuth(req, body, relayClient, apiKey, url, body.model || relayClient.defaultModel);
 
         if (body.stream) {
           const wireContents = buildWireContentsFromPayload(body);
@@ -3340,7 +3355,7 @@ function createRelayServer(options = {}) {
         const model = decodeURIComponent(geminiMatch[1]);
         const action = geminiMatch[2];
         const body = await readJsonBody(req);
-        const auth = extractRequestAuth(req, body, relayClient, apiKey, url);
+        const auth = extractRequestAuth(req, body, relayClient, apiKey, url, model);
 
         if (action === 'streamGenerateContent') {
           const wireContents = buildWireContentsFromPayload(body);
